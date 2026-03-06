@@ -6,28 +6,28 @@ The AI assistant's knowledge base is manually maintained. Current flow: scrape Z
 
 ## The approach: two repos
 
+Regardless of how the data gets into pgvector (see [HTTP vs shared DB comparison](#http-approach-vs-shared-database--comparison) below), both approaches share the same two-repo split:
+
 ### `focus-service-knowledge-base-processor` (new, Python/FastAPI)
 
-Handles everything between Zendesk and the focus-ai-service:
+Handles everything between Zendesk and pgvector:
 - Receives Zendesk webhooks
 - Fetches article content via Zendesk API
 - Converts HTML → markdown
 - Deduplicates images (perceptual hashing) and generates alt text
 - Enriches documents with LLM-generated metadata (summary, keywords, doc_type, question_variations)
-- Sends the processed document to the focus-ai-service
 
-### `focus-ai-service` (existing, changes via PR)
+How the processed documents reach pgvector depends on the integration approach:
+- **HTTP approach** — the knowledge-base-processor sends documents to the focus-ai-service, which handles embedding and storage. Requires a new endpoint in the focus-ai-service ([draft PR](https://github.com/teamleadercrm/focus-service-ai-assistant-prototype/pull/39)).
+- **Shared DB approach** (suggested by Brecht) — the knowledge-base-processor handles embedding itself and writes directly to pgvector with a write role. The focus-ai-service only reads. No changes needed in the focus-ai-service at all.
 
-New endpoint `POST /api/knowledge-base/documents` that:
-- Receives processed docs from the knowledge-base-processor
-- Embeds them (text-embedding-3-small)
-- Upserts into pgvector
+### `focus-ai-service` (existing)
+
+Already has `searchSimilar` for querying pgvector. With the shared DB approach, it needs zero changes — it just keeps reading as it does today.
 
 For long articles, two options are on the table (WIP):
 - **Chunking at ingestion time** — split documents >~1500 tokens at paragraph boundaries into ~4000 char chunks, embed each separately
-- **Pre-processing in Python** — identify the specific long articles (mostly tables that get mangled by HTML→markdown conversion) and split them upstream into logical sub-documents before they reach the focus-ai-service
-
-See `plan.md` for the full breakdown of focus-ai-service changes.
+- **Pre-processing in Python** — identify the specific long articles (mostly tables that get mangled by HTML→markdown conversion) and split them upstream into logical sub-documents before they reach pgvector
 
 ### Why two repos instead of one?
 
@@ -60,37 +60,13 @@ I've created a draft PR for these changes but I still need to test it as I didn'
 
 ---
 
-#### 1. All-in-one inside the focus-ai-service
-
-> Add the webhook endpoint, Zendesk fetching, HTML conversion, image processing, and LLM enrichment directly into the focus-ai-service. No second service.
-
-**Rejected** — Bloats the focus-ai-service with an entirely different domain (Zendesk API, HTML parsing, image processing). TypeScript ecosystem is weaker for image processing (no Pillow/imagehash equivalents). Every change to processing logic requires redeploying the focus-ai-service. If Zendesk rate-limits or the enrichment pipeline breaks, it could impact the assistant.
-
----
-
-#### 2. Cron-based periodic sync
-
-> A scheduled job fetches all articles from Zendesk, diffs against what's stored, and re-processes anything that changed.
-
-**Rejected** — Zendesk natively supports webhooks, so polling reinvents what's already built. Wasteful: most runs would find nothing changed, still costs API calls. Adds state management complexity (tracking what changed since last run). Delay between article update and knowledge base update (minutes to hours vs seconds). This is going to serve tens of thousands of users — doing it properly matters.
-
----
-
-#### 3. Processing inside focus-ai-service, webhook receiver as a thin proxy
-
-> A minimal webhook receiver forwards article IDs to the focus-ai-service, which does all the processing itself.
-
-**Rejected** — Same language-fit problem: TypeScript isn't ideal for the processing work. The focus-ai-service becomes responsible for Zendesk API auth, HTML parsing, image dedup, LLM enrichment calls. Tighter coupling: focus-ai-service now depends on Zendesk being available.
-
----
-
-#### 4. Shared database with role separation (suggested by Brecht)
+#### 1. Shared database with role separation (suggested by Brecht)
 
 > Instead of the knowledge-base-processor sending documents over HTTP, have it write directly to pgvector (including embedding). The focus-ai-service only needs read access — its existing `searchSimilar` query works without any changes.
 
-This came up after the initial brainstorm, which is why the HTTP approach was the starting point. It's a strong alternative worth comparing directly.
+This came up after the initial brainstorm, which is why the HTTP approach was the starting point. It's a really clean alternative — the focus-ai-service needs zero changes, the knowledge-base-processor owns the full pipeline end-to-end, and DB role separation keeps permissions tight.
 
-**How it works:** The knowledge-base-processor handles the full pipeline end-to-end — fetching, processing, embedding, and writing to the same `documents` + `embeddings` tables the focus-ai-service already reads from. The focus-ai-service doesn't change at all. DB role separation ensures the knowledge-base-processor has write access and the focus-ai-service has read-only access. Schema ownership stays with the focus-ai-service (drizzle migrations), the knowledge-base-processor just writes compatible rows.
+**How it works:** The knowledge-base-processor handles fetching, processing, embedding, and writing to the same `documents` + `embeddings` tables the focus-ai-service already reads from. DB role separation ensures the knowledge-base-processor has write access and the focus-ai-service has read-only access. Schema ownership stays with the focus-ai-service (drizzle migrations), the knowledge-base-processor just writes compatible rows.
 
 ### HTTP approach vs shared database — comparison
 
@@ -110,3 +86,27 @@ This came up after the initial brainstorm, which is why the HTTP approach was th
 **Shared DB pros:** Simpler overall — no new endpoint, no inter-service HTTP calls, no changes to the focus-ai-service at all. The knowledge-base-processor owns the full pipeline. Role separation prevents accidental writes from the wrong service, which is the more future-proof setup as the team grows or more services connect to this data.
 
 Both approaches keep the two-repo split and webhooks. The difference is just how processed documents get into pgvector.
+
+---
+
+#### 2. All-in-one inside the focus-ai-service
+
+> Add the webhook endpoint, Zendesk fetching, HTML conversion, image processing, and LLM enrichment directly into the focus-ai-service. No second service.
+
+**Rejected** — Bloats the focus-ai-service with an entirely different domain (Zendesk API, HTML parsing, image processing). TypeScript ecosystem is weaker for image processing (no Pillow/imagehash equivalents). Every change to processing logic requires redeploying the focus-ai-service. If Zendesk rate-limits or the enrichment pipeline breaks, it could impact the assistant.
+
+---
+
+#### 3. Cron-based periodic sync
+
+> A scheduled job fetches all articles from Zendesk, diffs against what's stored, and re-processes anything that changed.
+
+**Rejected** — Zendesk natively supports webhooks, so polling reinvents what's already built. Wasteful: most runs would find nothing changed, still costs API calls. Adds state management complexity (tracking what changed since last run). Delay between article update and knowledge base update (minutes to hours vs seconds). This is going to serve tens of thousands of users — doing it properly matters.
+
+---
+
+#### 4. Processing inside focus-ai-service, webhook receiver as a thin proxy
+
+> A minimal webhook receiver forwards article IDs to the focus-ai-service, which does all the processing itself.
+
+**Rejected** — Same language-fit problem: TypeScript isn't ideal for the processing work. The focus-ai-service becomes responsible for Zendesk API auth, HTML parsing, image dedup, LLM enrichment calls. Tighter coupling: focus-ai-service now depends on Zendesk being available.
