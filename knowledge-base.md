@@ -2,7 +2,7 @@
 
 ## The problem
 
-The AI assistant's knowledge base is manually maintained. Current flow: scrape Zendesk → run 10 Python scripts locally → copy markdown files into the repo → run `db:ingest`. This means the knowledge base goes stale whenever articles change, and we're stuck at 33 docs when there are 656+ available.
+The AI assistant's knowledge base is manually maintained. Current flow: scrape Zendesk → run 10 Python scripts locally → copy markdown files into the repo → run `db:ingest`. We currently have 33 docs — not because we can't add more, but because we deliberately kept it small rather than bloating the repo without a proper pipeline in place. There are 656+ articles available in Zendesk.
 
 ## The approach: two repos
 
@@ -84,6 +84,29 @@ I've created a draft PR for these changes but I still need to test it as I didn'
 
 ---
 
-### Why the current approach wins
+#### 4. Shared database with role separation (suggested by Brecht)
 
-The two-repo webhook-driven approach keeps each service focused on what it does well. The Python processor handles the messy transformation work (HTML, images, LLM calls). The focus-ai-service handles what it already does (embeddings, pgvector, serving). They communicate over the internal network like every other service in the stack. If we need to change how articles are processed, we deploy the processor. If we need to change how they're embedded, we deploy the focus-ai-service. Neither blocks the other.
+> Instead of the processor sending documents over HTTP, have it write directly to pgvector (including embedding). The focus-ai-service only needs read access — its existing `searchSimilar` query works without any changes.
+
+This came up after the initial brainstorm, which is why the HTTP approach was the starting point. It's a strong alternative worth comparing directly.
+
+**How it works:** The processor handles the full pipeline end-to-end — fetching, processing, embedding, and writing to the same `documents` + `embeddings` tables the focus-ai-service already reads from. The focus-ai-service doesn't change at all. DB role separation ensures the processor has write access and the focus-ai-service has read-only access. Schema ownership stays with the focus-ai-service (drizzle migrations), the processor just writes compatible rows.
+
+### HTTP approach vs shared database — comparison
+
+| | HTTP | Shared DB |
+|---|---|---|
+| **Focus-ai-service changes** | New endpoint, new route, draft PR | None |
+| **Embedding ownership** | Focus-ai-service | Processor |
+| **Coupling type** | API contract (JSON payload) | Schema contract (table structure) |
+| **Failure mode** | HTTP errors, timeouts | DB connection issues |
+| **Schema changes** | Only focus-ai-service cares | Both services need to stay in sync |
+| **Runtime complexity** | Two hops (HTTP + DB write) | One hop (direct DB write) |
+| **Setup** | No DB config needed | One-time: create DB roles, grant permissions |
+| **Processor scope** | Processing only | Processing + embedding |
+
+**HTTP pros:** Clean API boundary — the processor doesn't need to know about the DB schema or embedding model. If the embedding strategy changes, only the focus-ai-service needs updating.
+
+**Shared DB pros:** Simpler overall — no new endpoint, no inter-service HTTP calls, no changes to the focus-ai-service at all. The processor owns the full pipeline. Role separation prevents accidental writes from the wrong service, which is the more future-proof setup as the team grows or more services connect to this data.
+
+Both approaches keep the two-repo split and webhooks. The difference is just how processed documents get into pgvector.
