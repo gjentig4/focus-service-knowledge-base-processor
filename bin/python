@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Build the image if it doesn't exist
+IMAGE_NAME="focus-service-knowledge-base-processor-python:latest"
+if ! docker image inspect "$IMAGE_NAME" &> /dev/null; then
+    echo "Building Python Docker image (first time only)..."
+    docker build -t "$IMAGE_NAME" -f "$PROJECT_ROOT/docker/python/Dockerfile" "$PROJECT_ROOT" > /dev/null
+fi
+
+TTY_OPTS=""
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY_OPTS="-it"
+fi
+
+# Load env files in the same order as compose.yaml (later overrides earlier)
+ENV_OPTS=""
+for envfile in .env.dist secrets.env .env; do
+    if [ -f "$PROJECT_ROOT/$envfile" ]; then
+        ENV_OPTS="$ENV_OPTS --env-file $PROJECT_ROOT/$envfile"
+    fi
+done
+
+docker run $TTY_OPTS --init --rm \
+    --network tlnetwork \
+    $ENV_OPTS \
+    -e PYTHONPATH=/code \
+    --volume "$PROJECT_ROOT":/code:delegated \
+    --volume /code/.venv \
+    --workdir /code \
+    "$IMAGE_NAME" python "$@"
